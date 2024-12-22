@@ -57,6 +57,9 @@ from src.utils import (
     set_seed,
 )
 
+# from accelerate import Accelerator, InitProcessGroupKwargs
+# from datetime import timedelta
+
 tqdm = partial(tqdm, ncols=0, leave=False)
 
 TIMEOUT = 10
@@ -65,15 +68,22 @@ cot_trigger = None
 answer_trigger = None
 
 
+
+# # 初始化 accelerator
+# accelerator = Accelerator(
+#     kwargs_handlers=[InitProcessGroupKwargs(timeout=timedelta(seconds=18000))]
+# )
+
+
 def setup_cot(src_name):
-    assert src_name in ["gsm8k", "mathqa", "svamp", "mathqa-numeric"]
+    # 修改为支持意图分类的数据格式
     global instruction
-    global cot_trigger
+    global cot_trigger 
     global answer_trigger
-    # Complete output is in this form: f'{instruction}{question.strip()}{cot_trigger}{answer_cot.strip()}'
-    instruction = "Question:\n"
-    cot_trigger = "\nAnswer reasoning:\n"
-    answer_trigger = "\nTherefore, the answer is: "
+    
+    instruction = "Input:\n"  # 输入提示语
+    cot_trigger = "\nReasoning:\n"  # 推理过程提示语
+    answer_trigger = "\nTherefore, the intents are: "  # 最终答案提示语
     return
 
 
@@ -82,6 +92,7 @@ post_process_final_answer_fn_mapper = {
     "svamp": lambda x: float(x.replace(",", "").strip()),
     "mathqa": lambda x: x.lower().replace('"', "").replace("'", "").strip(),
     "mathqa-numeric": lambda x: float(x),
+    "intent": lambda x: set(x.lower().strip().split(",")),
 }
 ### the answer_cot is a list of answer_cot
 post_process_answer_cot_fn_mapper = {
@@ -111,6 +122,14 @@ post_process_answer_cot_fn_mapper = {
     ("nl", "mathqa-numeric"): lambda answer_cot: [
         floatify(res.split(answer_trigger)[-1].strip()) for res in answer_cot
     ],
+    ("python", "intent"): lambda answer_cot: [
+        set(res.lower().strip().split(","))
+        for res in run_python_code(programs=answer_cot, TIMEOUT=TIMEOUT)
+    ],
+    ("nl", "intent"): lambda answer_cot: [
+        set(res.split(answer_trigger)[-1].lower().strip().split(","))
+        for res in answer_cot
+    ],
 }
 compare_answer_fn_mapper = {
     "gsm8k": lambda extracted_ans, target_answer: abs(extracted_ans - target_answer)
@@ -122,6 +141,12 @@ compare_answer_fn_mapper = {
         extracted_ans - target_answer
     )
     <= 1e-2,
+    "intent": lambda extracted_ans, target_answer: (
+        1.0 if extracted_ans == target_answer
+        else len(extracted_ans & target_answer) / len(target_answer) 
+        if len(extracted_ans & target_answer) > 0
+        else 0.0
+    ),
 }
 
 
@@ -197,13 +222,15 @@ def prepare_datasets_and_data_loaders(args, tokenizer):
                 item = {k: item_values[i] for i, k in enumerate(all_keys)}
                 item_id, question, answer_value, answer_cot = (
                     item["item_id"],
-                    item["question"],
-                    item["answer_value"],
-                    item.get("answer_cot", None),
+                    item["question"],  # 输入文本
+                    item["answer_value"],  # 意图标签列表
+                    item.get("answer_cot", None),  # 推理过程
                 )
+                
                 question = question.strip()
                 if answer_value is not None:
-                    answer_value = answer_value.strip()
+                    # 确保答案格式统一
+                    answer_value = ",".join(sorted(answer_value.strip().split(",")))
 
                 if answer_cot:
                     answer_cot = answer_cot.strip()
@@ -214,12 +241,9 @@ def prepare_datasets_and_data_loaders(args, tokenizer):
                 output = f"{answer_cot}"
                 prefix_text = f"{instruction}{question}{cot_trigger}"
 
-                # Modify for particular datasets and engine
-                if (
-                    src_name in ["gsm8k", "mathqa", "svamp", "mathqa-numeric"]
-                    and args["engine"] == "python"
-                ):
-                    prefix_text += f'def solution():\n    """{question}"""\n'
+                # 如果使用 Python 引擎,添加函数包装
+                if args["engine"] == "python":
+                    prefix_text += f'def get_intents():\n    """{question}"""\n'
 
                 input_encode = tokenizer(input, add_special_tokens=False)
                 output_encode = tokenizer(output, add_special_tokens=False)
@@ -434,21 +458,12 @@ def rollout(
     for i, extracted_ans in enumerate(execute_fn(programs)):
         target_value = post_process_final_answer_fn_mapper[src_name](answer_values[i])
         if extracted_ans is not None:
-            if args["engine"] == "game24" or args["engine"] == "calcn":
-                is_correct = extracted_ans
+            if compare_answer_fn_mapper[src_name](extracted_ans, target_value):
+                is_correct = 1  # 完全正确给1分
             else:
-                if compare_answer_fn_mapper[src_name](extracted_ans, target_value):
-                    is_correct = 1
-                else:
-                    is_correct = 0.1
-                    # for mathqa, even though it can executed, if the results is not within a,b,c,d,xxx, still zero reward
-                    # because we want to give some reward for the prediction that able to select one of the answer
-                    # for example, the executed answer is "{}" in mathqa.
-                    # THIS PART IS TO BE DECIDED.
-                    # if src_name == 'mathqa' and not (len(extracted_ans) == 1 and extracted_ans.isalpha()):
-                    #     is_correct = 0
+                is_correct = 0.1  # 至少能执行但答案错误给0.1分
         else:
-            is_correct = 0
+            is_correct = 0  # 完全错误或无法执行给0分
         correctness.append(is_correct)
 
     model_input_ids = completed_tensors
@@ -996,19 +1011,20 @@ def evaluate_generation(args, model, dataset, dataloader, tokenizer):
                 "item_id": item["item_id"],
                 "answer_value": item["answer_value"],
             }
-            ## Processing target
+            
             target_cot = tar.strip().split(cot_trigger)[-1].strip()
             target_value = post_process_final_answer_fn_mapper[src_name](
                 cur_res["answer_value"]
             )
+            
             cur_res["target"] = target
             cur_res["target_cot"] = target_cot
             cur_res["target_value"] = target_value
-            ## Processing prediction
+            
             prediction_cot = pred.strip().split(cot_trigger)[-1].strip()
             cur_res["prediction"] = pred
             cur_res["prediction_cot"] = prediction_cot
-            cur_res["prediction_value"] = None  # Tobe filled
+            cur_res["prediction_value"] = None
             results.append(cur_res)
 
         execute_fn = post_process_answer_cot_fn_mapper[(args["engine"], src_name)]
